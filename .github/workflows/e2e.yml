@@ -1,0 +1,164 @@
+name: E2E
+
+# Runs the Playwright suite against MWIS.
+#   * Default: checks out the dev repo (isd-sysdev/mwis), boots it with Postgres, runs the suite.
+#   * With `base_url`: skips the boot and tests an already-deployed environment instead.
+#
+# Required secrets (Settings > Secrets and variables > Actions):
+#   MWIS_REPO_TOKEN        Fine-grained PAT, read-only "Contents" on isd-sysdev/mwis (boot-from-source mode)
+#   MWIS_ADMIN_EMAIL       Active System Admin on the deployed environment   (base_url mode only)
+#   MWIS_ADMIN_PASSWORD    its password                                       (base_url mode only)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      mwis_ref:
+        description: Branch, tag or SHA of isd-sysdev/mwis to test
+        default: master
+      base_url:
+        description: Test this deployed URL instead of booting the app from source (optional)
+        required: false
+  repository_dispatch:
+    types: [mwis-updated] # fired by the dev repo, see README "Triggering from the dev repo"
+  schedule:
+    - cron: "0 22 * * 0-4" # 06:00 PHT, Monday to Friday
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}-${{ inputs.base_url || 'source' }}
+  cancel-in-progress: true
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+  e2e:
+    needs: typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CI: "true"
+      MWIS_DEPLOYED_URL: ${{ inputs.base_url }}
+      MWIS_REF: ${{ inputs.mwis_ref || github.event.client_payload.ref || 'master' }}
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready" --health-interval=10s --health-timeout=5s --health-retries=5
+
+    steps:
+      - name: Checkout test repo
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies and Chromium
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+
+      # ---- Mode A: boot MWIS from source ---------------------------------
+      - name: Checkout MWIS (dev repo)
+        if: env.MWIS_DEPLOYED_URL == ''
+        uses: actions/checkout@v4
+        with:
+          repository: isd-sysdev/mwis
+          ref: ${{ env.MWIS_REF }}
+          token: ${{ secrets.MWIS_REPO_TOKEN }}
+          path: mwis-app
+
+      - name: Set up Ruby (version from the dev repo's .ruby-version)
+        if: env.MWIS_DEPLOYED_URL == ''
+        uses: ruby/setup-ruby@v1
+        with:
+          working-directory: mwis-app
+          bundler-cache: true
+
+      - name: Boot MWIS and create a throwaway System Admin
+        if: env.MWIS_DEPLOYED_URL == ''
+        working-directory: mwis-app
+        env:
+          RAILS_ENV: development
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432
+        run: |
+          sudo apt-get update && sudo apt-get install --no-install-recommends -y libpq-dev libvips
+
+          # Generated per run; masked in logs; never stored.
+          ADMIN_PASSWORD="Pw-$(openssl rand -hex 16)"
+          echo "::add-mask::$ADMIN_PASSWORD"
+          {
+            echo "MWIS_BASE_URL=http://127.0.0.1:3100"
+            echo "MWIS_ADMIN_EMAIL=e2e-admin@example.com"
+            echo "MWIS_ADMIN_PASSWORD=$ADMIN_PASSWORD"
+          } >> "$GITHUB_ENV"
+
+          bin/rails db:prepare
+          bin/rails tailwindcss:build
+          MWIS_ADMIN_EMAIL=e2e-admin@example.com MWIS_ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+            bin/rails runner '
+              RoleCatalogService.seed!
+              pw = ENV.fetch("MWIS_ADMIN_PASSWORD")
+              AdminBootstrapService.call(attributes: {
+                first_name: "E2E", last_name: "Admin", email: ENV.fetch("MWIS_ADMIN_EMAIL"),
+                password: pw, password_confirmation: pw
+              })'
+
+          nohup bin/rails server -b 127.0.0.1 -p 3100 > "$GITHUB_WORKSPACE/rails.log" 2>&1 &
+
+      # ---- Mode B: test a deployed environment ---------------------------
+      - name: Point tests at the deployed environment
+        if: env.MWIS_DEPLOYED_URL != ''
+        run: |
+          echo "MWIS_BASE_URL=$MWIS_DEPLOYED_URL" >> "$GITHUB_ENV"
+          echo "MWIS_ADMIN_EMAIL=${{ secrets.MWIS_ADMIN_EMAIL }}" >> "$GITHUB_ENV"
+          echo "MWIS_ADMIN_PASSWORD=${{ secrets.MWIS_ADMIN_PASSWORD }}" >> "$GITHUB_ENV"
+
+      - name: Wait for MWIS /up
+        run: npx --yes wait-on@8 --timeout 120000 "$MWIS_BASE_URL/up"
+
+      - name: Run Playwright
+        run: npx playwright test
+
+      - name: Upload Playwright report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            results/
+            test-results/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Upload Rails log
+        if: ${{ failure() && env.MWIS_DEPLOYED_URL == '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: rails-log
+          path: rails.log
+          retention-days: 7
+          if-no-files-found: ignore
